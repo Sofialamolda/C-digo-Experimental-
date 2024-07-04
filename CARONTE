@@ -287,27 +287,6 @@ def buscar_coords (x_centroide, y_centroide, wcs_imagen, tabla_catalogo):
     return fuente_info, distancia_2D, distancia_3D
 
 
-
-
-'''
-#Función para calcular el pico de señal de una fuente
-def calcular_pico(image_file, x_centroide, y_centroide, fwhm_estrella):
-    # Cargar la imagen FITS
-    image_data = fits.getdata(image_file)
-
-    # Crear apertura circular en la posición de la estrella
-    position = (x_centroide, y_centroide)
-    aperture = CircularAperture(position, r=fwhm_estrella)
-
-    # Realizar fotometría de apertura en la posición de la estrella
-    phot_table = aperture_photometry(image_data, aperture)
-
-    # Calcular el valor máximo dentro de la apertura
-    peak_value = np.max(phot_table['aperture_sum'])
-
-    return peak_value
-'''
-
 #Función para calcular el pico de señal de una fuente
 def calcular_pico_DAOStarFinder(image_file, x_centroide, y_centroide, fwhm_fuente, std, median):
     
@@ -380,21 +359,6 @@ def calcular_pico_DAOStarFinder(image_file, x_centroide, y_centroide, fwhm_fuent
     else:
         print("No se encontró ninguna estrella en las coordenadas proporcionadas.")
         return None
-
-
-'''   
-# Comprobar si alguna estrella detectada coincide con las coordenadas proporcionadas por el usuario
-    estrella_coincide = False
-    closest_source = None
-    min_distance = float('inf')
-    for source in sources:
-        x, y = source['xcentroid'], source['ycentroid']
-        distance = np.sqrt((x - x_centroide)**2 + (y - y_centroide)**2)
-        if distance < min_distance:  # Consideramos que coincide si está a menos de 2 píxeles de distancia
-            estrella_coincide = True
-            closest_source = source
-            break
-'''
 
 #Función para calcular la magnitud instrumental
 def m_inst(flujo_estrella_ADU, t_exp):
