@@ -1,0 +1,748 @@
+import astropy.units as u
+import matplotlib.pyplot as plt 
+import numpy as np
+import pyregion
+import subprocess
+import math
+import csv
+import os
+from astropy.coordinates import SkyCoord
+from astropy.io import fits
+from astropy.stats import sigma_clipped_stats, SigmaClip
+from astropy.table import Table
+from astropy.visualization import simple_norm
+from astropy.wcs import WCS
+from matplotlib.lines import Line2D
+from matplotlib.patches import Circle, Patch
+from matplotlib.ticker import MultipleLocator
+from photutils import DAOStarFinder
+from photutils.aperture import aperture_photometry, CircularAperture, ApertureStats
+from photutils.segmentation import detect_sources, detect_threshold
+from photutils.utils import circular_footprint
+from scipy.interpolate import interp1d
+from tabulate import tabulate
+
+#==============================================================================
+#                                   FUNCIONES
+#==============================================================================
+
+# Función para abrir el ds9
+def abrir_en_ds9(imagen_fits):
+    try:
+        subprocess.run(['ds9', '-version'], check=True)
+    except subprocess.CalledProcessError:
+        print("DS9 no está instalado o no está en el PATH. Por favor, instálalo o corrige el PATH.")
+        return
+
+    try:
+        ds9_process = subprocess.Popen(['ds9', imagen_fits])
+    except OSError as e:
+        print(f"No se pudo abrir la imagen {imagen_fits} en DS9:", e)
+        
+# Funcion para obtener información de la cabecera de la imagen
+def info_cabecera(imagen_fits):
+    """
+    Obtiene información específica de la cabecera de la imagen FITS.
+
+    Parámetros:
+    - imagen_fits: Ruta de la imagen FITS.
+
+    Devuelve:
+    - t_exp: Tiempo de exposición de la imagen.
+    - masa_aire: Masa de aire durante la observación.
+    -  filtro_inst: Filtro empleado en el instrumento.
+    - modo_lectura: Modo de lectura empleado.
+    """
+    # Abre la imagen FITS y obtiene el header
+    hdulist = fits.open(imagen_fits)
+    header = hdulist[0].header
+
+    # Obtiene el tiempo de exposición y la masa de aire del header
+    t_exp =float(header['EXPTIME'])
+    masa_aire = header['AIRMASS']
+    filtro_inst = header['INSFILTE']
+    modo_lectura = header['RMODE']
+
+    # Cierra el archivo FITS
+    hdulist.close()
+
+    return t_exp, masa_aire, filtro_inst, modo_lectura
+
+# Función para conocer el valor de la extinción atmosférica
+def extincion(filtro_inst):
+    """
+    Obtiene el valor de extinción según el filtro empleado en la observación.
+
+    Parámetros:
+    - filtro_inst: Filtro obtenido de la función info_cabecera.
+
+    Devuelve:
+    - extincion: Valor de extinción correspondiente al filtro.
+    """
+    # Definir el diccionario de valores de extinción para cada filtro
+    valores_extincion = {'U': 0.55, 'B': 0.25, 'V': 0.12, 'R': 0.09, 'I': 0.06}
+
+    # Obtener el valor de extinción según el filtro
+    extincion = valores_extincion.get(filtro_inst.upper(), None)
+
+    if extincion is None:
+        raise ValueError("Filtro no válido")
+
+    return extincion
+
+
+# Función para calcular el centroide y la FWHM
+def calcular_centroide_fwhm(imagen_fits, x_inicial, y_inicial):
+    """
+    Calcula el centroide y FWHM de una estrella en una imagen FITS.
+
+    Parámetros:
+    - imagen_fits: Ruta de la imagen FITS.
+    - x_inicial: Coordenada x inicial de la estrella.
+    - y_inicial: Coordenada y inicial de la estrella.
+
+    Devuelve:
+    - x_centroide: Coordenada x del centroide.
+    - y_centroide: Coordenada y del centroide.
+    - fwhm: FWHM de la estrella.
+    """
+
+    # Abre la imagen FITS y lee los datos
+    hdulist = fits.open(imagen_fits)
+    data = hdulist[0].data
+       
+    # Calcula el centroide y FWHM utilizando ApertureStats
+    aperture = CircularAperture((x_inicial, y_inicial), 8) # Usa radio de apertura 8 píxeles (aproximación inicial para seeing típico del IAC80)
+    aperstats = ApertureStats(data, aperture)
+    
+    x_centroide, y_centroide = aperstats.xcentroid, aperstats.ycentroid
+    fwhm_star_pix = aperstats.fwhm.value
+    
+    # Multiplica por escala de placa para tener la fwhm en unidades arcsec
+    fwhm_star_arcsec = fwhm_star_pix * 0.322
+
+    # Cierra el archivo FITS
+    hdulist.close()
+    
+    return x_centroide, y_centroide, fwhm_star_pix, fwhm_star_arcsec
+
+
+# Función para calcular el fondo de cielo de una imagen
+def fondo_cielo(imagen_fits):
+    """
+    Calcula el valor medio del fondo de cielo de una imagen FITS restando las 
+    fuentes detectadas en la imagen.
+
+    Parámetros:
+    - imagen_fits: Ruta de la imagen FITS.
+
+    Devuelve:
+    - bkg_mean: Valor medio del fondo de cielo de la imagen
+    """
+    data = imagen_fits[0].data
+    
+    # Define un recorte sigma donde se usa un valor de 3.0--> valores que están
+    # más allá de 3 desviaciones estándar serán considerados atípicos
+    sigma_clip = SigmaClip(sigma=3.0, maxiters=5)
+    
+    # Calcula el umbral para detectar las fuentes (estrellas)
+    umbral = detect_threshold(data, nsigma=5.0, sigma_clip=sigma_clip)
+
+    # Detecta las fuentes (estrellas) en la imagen
+    fuentes = detect_sources(data, umbral, npixels=10)
+
+    # Crea un patrón para la detección de fuentes circulares.
+    footprint = circular_footprint(radius=10)
+
+    # Crea una máscara para las fuentes detectadas
+    mask = fuentes.make_source_mask(footprint=footprint)
+
+    # Calcula la media, mediana y la desviación estándar recortada del fondo del 
+    # cielo excluyendo las áreas de las fuentes detectadas.
+    bkg_mean, bkg_median, bkg_std = sigma_clipped_stats(data, sigma=3.0, mask=mask)
+    
+    return bkg_median, bkg_mean, bkg_std
+
+'''
+# Funcion para realizar la fotometria de una fuente en la imagen 
+def fotometria_estrella(imagen_fits, x_centroide, y_centroide, fwhm_fuente, bkg_mean):
+    """
+    Realiza la fotometría de una estrella en la imagen.
+
+    Parámetros:
+    - imagen_fits: Ruta de la imagen FITS una vez sustraído el cielo.
+    - x_centroide: Coordenada x del centroide de la estrella.
+    - y_centroide: Coordenada y del centroide de la estrella.
+    - fwhm_fuente: Valor de la fwhm de la fuente.
+    - bkg_mean: valor medio del fondo de cielo de la imagen.
+
+    Devuelve:
+    - flux: Valor del flujo de la estrella en ADU.
+    """
+    
+    # Abre la imagen FITS y lee los datos
+    hdulist = fits.open(imagen_fits)
+    data = hdulist[0].data
+   
+    # Calcula la apertura circular con un radio igual a la fwhm
+    posiciones = [(x_centroide, y_centroide)]
+    radio_aper = fwhm_fuente
+    aperture_target = CircularAperture(posiciones, radio_aper)
+    
+    # Realiza la fotometría para la apertura definida
+    phot_table_target = aperture_photometry(data, aperture_target)
+    #aperture_sum_estrella = phot_table_target['aperture_sum'][0]
+    
+    # Calcula el fondo de cielo total y el flujo de la estrella
+    #total_bkg = int(np.mean(bkg_mean) * np.pi * radio_aper ** 2)
+    flux = int(phot_table_target['aperture_sum'][0]) #- total_bkg
+    
+    # Cierra el archivo FITS
+    hdulist.close()
+
+    return flux
+ 
+    
+# Función para calcular la relación señal-ruido (SNR) 
+def calcular_snr(flux, fwhm_fuente, bkg_mean, modo_lectura):
+    """
+    Calcula la relación señal-ruido (SNR).
+
+    Parámetros:
+    - flux: Flujo de la fuente.
+    - fwhm_fuente: Valor de la fwhm de la fuente.
+    - bkg_mean: Valor medio del fondo de cielo de la imagen.
+    - modo_lectura: Modo de lectura obtenido de la función info_cabecera.
+
+    Devuelve:
+    - snrs: Lista de relaciones señal-ruido (SNR) para distintos múltiplos de la fwhm.
+    """
+    
+    # Define una lista donde se almacenan los valores de la relación señal-ruido
+    snrs = []
+   
+   # Define los valores de ganancia y ruido de lectura según el modo de lectura
+    if modo_lectura == '1':
+        gain = 4.23
+        ron = 6.01
+    elif modo_lectura == '2':
+        gain = 8.54
+        ron = 11.62
+    elif modo_lectura == '3':
+        gain = 8.98
+        ron = 12.11
+    elif modo_lectura == '4':
+        gain = 0.79
+        ron = 5.31
+    elif modo_lectura == '5':
+        gain = 18.97
+        ron = 23.82
+    else:
+        raise ValueError("Modo de lectura no válido") 
+   
+        
+    # Define el rango de valores de fwhm que se desee
+    fwhm_values = np.arange(0.1, 4.5, 0.5)*fwhm_fuente
+    
+    # Calcula la relación señal-ruido (SNR) utilizando la fórmula dada
+    for aper in fwhm_values:
+        snr = flux * gain / np.sqrt(flux * gain + np.pi * aper ** 2 * bkg_mean * gain + np.pi * aper ** 2 * ron ** 2)
+        # Agrega el valor SNR calculado a la lista de relaciones señal-ruido (SNR)
+        snrs.append(snr)
+    
+    # Crea el gráfico
+    plt.figure()
+    plt.plot(fwhm_values, snrs, marker='o', linestyle='-')
+    plt.xlabel('Radio de apertura [arcsec]')
+    plt.ylabel('S/N ')
+    #plt.grid(True)
+    plt.title('Relacion señal-ruido vs Radio de apertura')
+    plt.show()
+    
+    return snrs, fwhm_values, gain
+    
+'''
+
+#########################################################################################################################
+
+def fotometria_estrella(imagen_fits, x_centroide, y_centroide, radio_aper):
+    """
+    Realiza la fotometría de una estrella en la imagen.
+
+    Parámetros:
+    - imagen_fits: Ruta de la imagen FITS una vez sustraído el cielo.
+    - x_centroide: Coordenada x del centroide de la estrella.
+    - y_centroide: Coordenada y del centroide de la estrella.
+    - radio_aper: Radio de la apertura circular.
+    - bkg_mean: valor medio del fondo de cielo de la imagen.
+
+    Devuelve:
+    - flux: Valor del flujo de la estrella en ADU.
+    """
+    
+    # Abre la imagen FITS y lee los datos
+    hdulist = fits.open(imagen_fits)
+    data = hdulist[0].data
+   
+    # Calcula la apertura circular con el radio proporcionado
+    posiciones = [(x_centroide, y_centroide)]
+    aperture_target = CircularAperture(posiciones, radio_aper)
+    
+    # Realiza la fotometría para la apertura definida
+    phot_table_target = aperture_photometry(data, aperture_target)
+    flux = int(phot_table_target['aperture_sum'][0])
+    
+    # Cierra el archivo FITS
+    hdulist.close()
+
+    return flux
+
+
+def calcular_snr(imagen_fits, x_centroide, y_centroide, fwhm_fuente, bkg_mean, modo_lectura):
+    """
+    Calcula la relación señal-ruido (SNR).
+
+    Parámetros:
+    - imagen_fits: Ruta de la imagen FITS una vez sustraído el cielo.
+    - x_centroide: Coordenada x del centroide de la estrella.
+    - y_centroide: Coordenada y del centroide de la estrella.
+    - fwhm_fuente: Valor de la fwhm de la fuente.
+    - bkg_mean: Valor medio del fondo de cielo de la imagen.
+    - modo_lectura: Modo de lectura obtenido de la función info_cabecera.
+
+    Devuelve:
+    - snrs: Lista de relaciones señal-ruido (SNR) para distintos múltiplos de la fwhm.
+    """
+    
+    # Define una lista donde se almacenan los valores de la relación señal-ruido
+    snrs = []
+    flux_valores = []
+   
+    # Define los valores de ganancia y ruido de lectura según el modo de lectura
+    if modo_lectura == '1':
+        gain = 4.23
+        ron = 6.01
+    elif modo_lectura == '2':
+        gain = 8.54
+        ron = 11.62
+    elif modo_lectura == '3':
+        gain = 8.98
+        ron = 12.11
+    elif modo_lectura == '4':
+        gain = 0.79
+        ron = 5.31
+    elif modo_lectura == '5':
+        gain = 18.97
+        ron = 23.82
+    else:
+        raise ValueError("Modo de lectura no válido") 
+   
+        
+    # Define el rango de valores de fwhm que se desee
+    ejex= np.arange(0.5, 4.5, 0.5)
+    fwhm_values = np.arange(0.5, 4.5, 0.5) * fwhm_fuente
+    
+    # Calcula la relación señal-ruido (SNR) utilizando la fórmula dada
+    for aper in fwhm_values:
+        flux = fotometria_estrella(imagen_fits, x_centroide, y_centroide, aper)
+        snr = flux * gain / np.sqrt(flux * gain + np.pi * aper ** 2 * bkg_mean * gain + np.pi * aper ** 2 * ron ** 2)
+        # Agrega el valor SNR calculado a la lista de relaciones señal-ruido (SNR)
+        snrs.append(snr)
+        flux_valores.append(flux)
+    
+    # Crear la función interpoladora
+    interpolador = interp1d(ejex, snrs, kind='cubic')
+
+    # Definir un rango más fino para el eje x para una curva más suave
+    ejex_fino = np.linspace(min(ejex), max(ejex), 500)
+    
+    # Interpolar los valores de SNR en el rango fino
+    snrs_fino = interpolador(ejex_fino)
+    
+    # Graficar la curva suavizada
+    plt.figure()
+    plt.plot(ejex_fino, snrs_fino, color='blue', linestyle='-', linewidth=1, marker='')
+
+    # Agregar los puntos originales si se desea
+    plt.plot(ejex, snrs, marker='.', color='black', linestyle='None', markersize=2)  # Puntos originales como círculos rojos
+
+    plt.grid(True, color='lightgrey')
+    plt.xlabel('Radio de apertura [FWHM]')
+    plt.ylabel('SNR ')
+    plt.title('Relación señal-ruido vs Radio de apertura')
+    plt.show()
+    return snrs, fwhm_values, gain, flux_valores
+
+
+#########################################################################################################################
+
+
+
+
+# Función para buscar coordenadas en un catálogo
+def buscar_coords (x_centroide, y_centroide, wcs_imagen, tabla_catalogo):
+    '''
+    Busca las coordenadas de la estrella en el catálogo para conocer la info de la fuente
+    
+    Parámetros:
+    - x_centroide: Coordenada x del centroide.
+    - y_centroide: Coordenada y del centroide.
+    - wcs_imagen: Objeto WCS de la imagen FITS que contiene la información de la proyección y coordenadas.
+    - tabla_catalogo: Tabla del catálogo que contiene las coordenadas de las fuentes.
+        
+    Devuelve: 
+    - fuente_info: información de la fuente encontrada en el catálogo
+    '''
+
+    # Convierte las coordenadas del centroide a coordenadas del catálogo usando WCS
+    ra, dec = wcs_imagen.all_pix2world(x_centroide, y_centroide, 0)
+    
+    # Crea un objeto SkyCoord con las coordenadas del cielo del centroide de la fuente
+    coord_cielo = SkyCoord(ra=ra*u.degree, dec=dec*u.degree)
+    
+    # Crea un objeto SkyCoord con las coordenadas del catálogo
+    catalog = SkyCoord(ra=tabla_catalogo["RA"], dec=tabla_catalogo["DEC"])
+    
+    # Busca la fuente más cercana en el catálogo basada en las coordenadas del cielo 
+    idx, d2d, d3d = coord_cielo.match_to_catalog_sky(catalog)
+    
+    # Obtiene la información de la fuente del catálogo utilizando el índice obtenido
+    fuente_info = tabla_catalogo[idx]
+    distancia_2D = d2d.value
+    distancia_3D = d3d.value
+
+    return fuente_info, distancia_2D, distancia_3D
+
+
+
+
+'''
+#Función para calcular el pico de señal de una fuente
+def calcular_pico(image_file, x_centroide, y_centroide, fwhm_estrella):
+    # Cargar la imagen FITS
+    image_data = fits.getdata(image_file)
+
+    # Crear apertura circular en la posición de la estrella
+    position = (x_centroide, y_centroide)
+    aperture = CircularAperture(position, r=fwhm_estrella)
+
+    # Realizar fotometría de apertura en la posición de la estrella
+    phot_table = aperture_photometry(image_data, aperture)
+
+    # Calcular el valor máximo dentro de la apertura
+    peak_value = np.max(phot_table['aperture_sum'])
+
+    return peak_value
+'''
+
+#Función para calcular el pico de señal de una fuente
+def calcular_pico_DAOStarFinder(image_file, x_centroide, y_centroide, fwhm_fuente, std, median):
+    
+    # Cargar la imagen FITS
+    image_data = fits.getdata(image_file)
+    
+    # Calcular estadísticas básicas de la imagen para la detección de fuentes
+    #mean, median, std = sigma_clipped_stats(image_data, sigma=3.0)
+
+    # Usar DAOStarFinder para detectar todas las estrellas
+    daofind = DAOStarFinder(fwhm=fwhm_fuente, threshold=5.*std)
+    sources = daofind(image_data)
+
+    # Encontrar la estrella más cercana a las coordenadas proporcionadas
+    closest_source = None
+    min_distance = float('inf')  # Inicializar con una distancia infinita
+    for source in sources:
+        x, y = source['xcentroid'], source['ycentroid']
+        distance = np.sqrt((x - x_centroide)**2 + (y - y_centroide)**2)
+        if distance < min_distance:
+            closest_source = source
+            min_distance = distance
+
+    # Mostrar la información de la estrella más cercana para conocer el valor del pico
+    if closest_source is not None:
+        print('--------------------------------------------------------------------')
+        print(f'Información de la estrella usando DAOStarFinder:')
+        for col in closest_source.colnames:
+            if col not in ('id', 'npix'):
+                print(f'{col}: {closest_source[col]:.2f}')
+
+        
+        
+        # Extraer el valor del pico
+        peak_value = closest_source['peak']
+        # Extraer el valor de la mag
+        mag = closest_source['mag']
+        
+        
+        # Crear una figura
+        fig, ax = plt.subplots(figsize=(12, 8))
+ 
+        # Mostrar la imagen FITS
+        ax.imshow(image_data, cmap='gray', origin='lower')
+ 
+        # Dibujar la estrella
+        circle = Circle((x_centroide, y_centroide), 10, edgecolor='red', facecolor='none')
+        ax.add_patch(circle)
+        ax.text(x_centroide+80, y_centroide+50, 'Fuente', color='red', fontsize=13, ha='center')
+ 
+        # Marcar las fuentes detectadas con DAOStarFinder en la imagen
+        ax.plot(sources['xcentroid'], sources['ycentroid'], '.', markersize=3, color='aquamarine')
+ 
+        # Añadir títulos a los ejes
+        ax.set_xlabel('X [pix]')
+        ax.set_ylabel('Y [pix]')
+        ax.xaxis.set_minor_locator(MultipleLocator(100))   # X: separación cada 100 unidades
+        ax.yaxis.set_minor_locator(MultipleLocator(100))   # Y: separación cada 100 unidades
+ 
+        # Crear leyenda
+        detected_patch = Line2D([0], [0], marker='.', color='aquamarine', label='Fuentes detectadas', linestyle='None', markersize=8)
+        catalog_patch = Line2D([0], [0], marker='o', color='red', label='Fuente seleccionada', linestyle='None', markersize=8, markerfacecolor='none', markeredgewidth=1.0)
+        legend = ax.legend(handles=[detected_patch, catalog_patch], loc='upper left', facecolor='white', framealpha=0.8)
+ 
+        # Mostrar la figura
+        plt.show()
+           
+        return peak_value, mag         
+        
+    else:
+        print("No se encontró ninguna estrella en las coordenadas proporcionadas.")
+        return None
+
+
+'''   
+# Comprobar si alguna estrella detectada coincide con las coordenadas proporcionadas por el usuario
+    estrella_coincide = False
+    closest_source = None
+    min_distance = float('inf')
+    for source in sources:
+        x, y = source['xcentroid'], source['ycentroid']
+        distance = np.sqrt((x - x_centroide)**2 + (y - y_centroide)**2)
+        if distance < min_distance:  # Consideramos que coincide si está a menos de 2 píxeles de distancia
+            estrella_coincide = True
+            closest_source = source
+            break
+'''
+
+#Función para calcular la magnitud instrumental
+def m_inst(flujo_estrella_ADU, t_exp):
+    m_i = -2.5 * math.log10(flujo_estrella_ADU/t_exp)
+    return m_i
+  
+# Función para calcular mag_zp
+def m_zp(filtro, minstru, info_fuente, k, X):
+    if filtro == 'U':
+        mcalib = info_fuente["MAG_U"]
+    elif filtro == 'B':
+        mcalib = info_fuente["MAG_B"]
+    elif filtro == 'V':
+        mcalib = info_fuente["MAG_V"]
+    elif filtro == 'R':
+        mcalib = info_fuente["MAG_R"]
+    elif filtro == 'I':
+        mcalib = info_fuente["MAG_I"]
+    else:
+        raise ValueError(f"Filtro '{filtro}' no reconocido.")
+    
+    mag_zp = mcalib - minstru + k * X
+    return mag_zp  
+    
+#==============================================================================
+# Uso de las funciones
+if __name__ == "__main__":
+    
+    # Solicita nombre de la imagen FITS    
+    nombre_imagen = input("Introduce el nombre de la imagen FITS: ")
+    ruta_imagen = '/home/usuario/Documentos/TFM/4_noviembre/' + nombre_imagen
+    hdul_imagen = fits.open(ruta_imagen)
+    wcs_imagen = WCS(hdul_imagen[0].header)
+    
+    # Abre la imagen en el ds9 para visualizarla
+    #abrir_en_ds9(ruta_imagen)
+    
+    # Lee el catálogo FITS y lo lee como tabla
+    catalogo_ruta = '/home/usuario/Documentos/TFM/4_noviembre/standards_new.fits'
+    tabla_catalogo = Table.read(catalogo_ruta)
+    t_exposicion, masa_aire, filtro, modo_lectura = info_cabecera(ruta_imagen)
+    
+    extincion_valor = extincion(filtro)
+
+    # Pide al usuario que introduzca las coordenadas aproximadas de la estrella
+    x_inicial = float(input("Introduce la coordenada x de la estrella: "))
+    y_inicial = float(input("Introduce la coordenada y de la estrella: "))
+    
+    # Pide al usuario que introduzca el valor de la fwhm 
+    fwhm_user_pix = float(input("Introduce el valor de la fwhm en PIXELES: "))
+    
+    # Calcula el centroide y FWHM
+    x_centroide, y_centroide, fwhm_fot_pix, fwhm_fot_arcsec = calcular_centroide_fwhm(ruta_imagen, x_inicial, y_inicial)
+    
+    # Calcula el valor medio del fondo de cielo de la imagen en ADU
+    bkg_median, bkg_mean, bkg_std = fondo_cielo(hdul_imagen)  
+    
+    
+    # Resta el fondo de cielo a la imagen total
+    data_sin_cielo = hdul_imagen[0].data - bkg_median
+
+    # Guarda la nueva imagen FITS con el fondo de cielo restado
+    fits.writeto('imagen_menos_cielo.fits', data_sin_cielo, hdul_imagen[0].header, overwrite=True)
+        
+    # Realiza la fotometría de la estrella
+    flujo_fot_ADU  = fotometria_estrella('imagen_menos_cielo.fits', x_centroide, y_centroide, fwhm_fot_pix)
+    flujo_user_ADU  = fotometria_estrella('imagen_menos_cielo.fits', x_centroide, y_centroide, fwhm_user_pix)
+
+    # Calcula la relación señal-ruido (SNR)
+    snrs_fot, multiplos_fwhm_fot, ganancia_fot, flujo_valores_fot = calcular_snr( 'imagen_menos_cielo.fits', x_centroide, y_centroide, fwhm_fot_pix, bkg_median, modo_lectura)
+    snrs_user, multiplos_fwhm_user, ganancia_user, flujo_valores_user = calcular_snr('imagen_menos_cielo.fits', x_centroide, y_centroide, fwhm_user_pix, bkg_median, modo_lectura)
+
+    
+    # Calcula el valor del pico
+    #peak_value = pico_formula_INT(flujo_estrella, t_exposicion, fwhm_estrella_arcsec) #Esto sale un valor gigante, hay algo que está mal
+    #peak_signal = calcular_pico(ruta_imagen, x_centroide, y_centroide,fwhm_estrella_pix)
+    peak_signal_DAO_fot, magnitud_value_fot  = calcular_pico_DAOStarFinder(ruta_imagen, x_centroide, y_centroide, fwhm_fot_pix, bkg_std,bkg_median)
+    peak_signal_DAO_user, magnitud_value_user  = calcular_pico_DAOStarFinder(ruta_imagen, x_centroide, y_centroide, fwhm_user_pix, bkg_std,bkg_median)
+
+    
+    # Busca la información de la estrella en el catálogo
+    info_fuente,dist_angular,dist_tridim = buscar_coords(x_centroide, y_centroide, wcs_imagen, tabla_catalogo)
+    
+    #Calcula el valor del pico, del flujo y del fondo de cielo en unidades físicas
+    peak_fotones_fot = peak_signal_DAO_fot * ganancia_fot
+    peak_fotones_user = peak_signal_DAO_user * ganancia_user
+    flujo_fot_e = flujo_fot_ADU * ganancia_fot / t_exposicion
+    flujo_user_e = flujo_user_ADU * ganancia_user / t_exposicion
+    fondo_cielo_fot = bkg_median * ganancia_fot/ t_exposicion
+    fondo_cielo_user = bkg_median * ganancia_user/ t_exposicion
+    
+    #Calcula la magnitud instrumental
+    mag_inst_fot= m_inst(flujo_fot_ADU, t_exposicion)
+    mag_inst_user= m_inst(flujo_user_ADU, t_exposicion)
+    
+    #Calcula la magnitud_zeropoint 
+    mag_zp_fot=m_zp(filtro, mag_inst_fot, info_fuente, extincion_valor, masa_aire)
+    mag_zp_user=m_zp(filtro, mag_inst_user, info_fuente, extincion_valor, masa_aire)
+ 
+      
+  # Muestra los resultados por pantalla
+  
+    print("------------------------------------------------------------------")  
+    print("Información de la cabecera de la imagen:")
+    print("Filtro utilizado: ", filtro)
+    print("Modo de lectura utilizado: ", modo_lectura)
+    print("Tiempo de exposición: ", t_exposicion, "segundos")
+    print("Masa de aire: ", masa_aire)
+    print("------------------------------------------------------------------")   
+    print("\n")   
+    print("Extinción atmosférica: ", extincion_valor)
+    print("Ganancia: ", ganancia_fot, ganancia_user)
+    print("------------------------------------------------------------------")   
+    print("\n")
+    print("Fondo de cielo: ",bkg_median, " ADU")
+    print("Fondo de cielo: ", fondo_cielo_fot, " e/sec")
+    print("Fondo de cielo: ", fondo_cielo_user, " e/sec")
+    print("------------------------------------------------------------------")   
+    print("\n")
+    print("FWHM usuario: ", fwhm_user_pix, " pix")
+    print("FWHM usuario: " , fwhm_user_pix*0.322, " arcsec")
+    print("\n")
+    print("FWHM fot: ", fwhm_fot_pix," pix")
+    print("FWHM fot: ", fwhm_fot_arcsec, " arcsec")
+    print("------------------------------------------------------------------")   
+    print("\n")
+    print("Flujo fot: ", flujo_fot_ADU, " ADU")
+    print("Flujo fot: ", flujo_fot_e, " e/sec" )
+    print("Flujo usuario: ", flujo_user_ADU, " ADU")
+    print("Flujo usuario: ", flujo_user_e, " e/sec" )
+    print("------------------------------------------------------------------")   
+    print("\n")
+    print("Pico fot: ", peak_signal_DAO_fot, ' ADU')
+    print("Pico fot: ", peak_fotones_fot, "e")
+    print("Pico usuario: ", peak_signal_DAO_user, ' ADU')
+    print("Pico usuario: ", peak_fotones_user, "e")
+    print("------------------------------------------------------------------")   
+    print("\n")
+    print("SNR fot: ", snrs_fot[1])
+    print("SNR usuario: ", snrs_user[1])
+    print("------------------------------------------------------------------")   
+    print("\n")
+    print("Magnitud instrumental fot: ", magnitud_value_fot)
+    print("Magnitud instrumental usuario: ", magnitud_value_user)
+    print("\n")
+    print("Magnitud zeropoint fot:" , mag_zp_fot)
+    print("Magnitud zeropoint usuario:" , mag_zp_user)
+    print("------------------------------------------------------------------")
+    print("\n")
+    # Mostrar valores de centroides y FWHM en forma de tabla
+    print("FWHM usuario")
+    print("\Centroides, FWHM user y de la SNR para distintos múltiplos de la FWHM, son los siguientes:")
+    tabla = [["x centroide", "y centroide", "Radio de Apertura (multiplos FWHM (pix))", "SNR"]]
+  
+    for rad, snr in zip(multiplos_fwhm_user, snrs_user):
+        tabla.append([x_centroide, y_centroide, rad, snr])
+    print(tabulate(tabla, headers="firstrow"))
+    print("------------------------------------------------------------------")
+    print("\n")
+    print("FWHM fotometria")
+    print("\n Centroides, FWHM fot y de la SNR para distintos múltiplos de la FWHM, son los siguientes:")
+    tabla = [["x centroide", "y centroide", "Radio de Apertura (multiplos FWHM (pix))", "SNR"]]
+    
+    for rad, snr in zip(multiplos_fwhm_fot, snrs_fot):
+        tabla.append([x_centroide, y_centroide, rad, snr])
+    print(tabulate(tabla, headers="firstrow"))
+    print("------------------------------------------------------------------")
+    print("\n")
+    # Imprime la información de la estrella
+    print(f'Información de la fuente en el catálogo:')
+    print(f'Nombre fuente: {info_fuente["NAME"]}')
+    print(f'RA: {info_fuente["RA"]}')
+    print(f'Dec: {info_fuente["DEC"]}')
+    print(f'Magnitud en filtro U: {info_fuente["MAG_U"]}')
+    print(f'Error en filtro U: {info_fuente["ERRMAG_U"]}')
+    print(f'Magnitud en filtro B: {info_fuente["MAG_B"]}')
+    print(f'Error en filtro B: {info_fuente["ERRMAG_B"]}')
+    print(f'Magnitud en filtro V: {info_fuente["MAG_V"]}')
+    print(f'Error en filtro V: {info_fuente["ERRMAG_V"]}')
+    print(f'Magnitud en filtro R: {info_fuente["MAG_R"]}')
+    print(f'Error en filtro R: {info_fuente["ERRMAG_R"]}')
+    print(f'Magnitud en filtro I: {info_fuente["MAG_I"]}')
+    print(f'Error en filtro I: {info_fuente["ERRMAG_I"]}')
+
+    # Datos que quieres guardar
+    data = {
+        "fwhm_fot_pix": fwhm_fot_pix,
+        "flujo_fot_ADU": flujo_fot_ADU,
+        "flujo_user_ADU": flujo_user_ADU,
+        "peak_signal_DAO_fot": peak_signal_DAO_fot,
+        "peak_signal_DAO_user": peak_signal_DAO_user,
+        "snrs_fot": snrs_fot[1],
+        "snrs_user": snrs_user[1],
+        "magnitud_value_fot": magnitud_value_fot,
+        "magnitud_value_user": magnitud_value_user,
+        "mag_zp_fot": mag_zp_fot,
+        "mag_zp_user": mag_zp_user
+    }
+    
+    # Nombre del archivo
+    filename = 'resultadosI.txt'
+    
+    # Comprueba si el archivo ya existe
+    file_exists = os.path.exists(filename)
+    
+    # Abrir el archivo en modo de adición y escribir los nuevos datos
+    with open(filename, 'a') as file:
+        # Si el archivo no existe, escribir los nombres de las variables como encabezado
+        if not file_exists:
+            header = "\t".join(data.keys()) + "\n"
+            file.write(header)
+        
+        # Escribir los valores de las variables
+        values = "\t".join(map(str, data.values())) + "\n"
+        file.write(values)
+    
+    print("Datos añadidos a resultados.txt")  
+
+
+
+
+
+    # Cierra los archivos FITS
+    hdul_imagen.close()
